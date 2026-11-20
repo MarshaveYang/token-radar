@@ -3,13 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar · pre-token protocols priced against the market</title>
-<meta name="description" content="Every protocol that has no token yet, priced against what the market pays per dollar of TVL in its own category.">
+<title>Token Radar · pre-token protocols priced from their own record</title>
+<meta name="description" content="Every protocol that records no token, priced by the market's own multiple for its category, odds-weighted, with the cost and time of farming each one.">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <a class="skip" href="#board">Skip to the board</a>
-<main id="board" tabindex="-1" aria-busy="true"></main>
+<header class="top">
+  <a class="brand" href="#/">
+    <span class="mark" aria-hidden="true"></span>
+    <span>Token Radar</span>
+  </a>
+  <nav class="where" id="where" aria-label="Where you are"></nav>
+  <p class="meta" id="meta"></p>
+</header>
+<main id="board" tabindex="-1"></main>
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
