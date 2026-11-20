@@ -102,18 +102,17 @@
       '<section class="hero">' +
         '<div>' +
           '<h1>Every protocol that records <em>no token</em>, priced from the record it does have</h1>' +
-          '<p class="lede">The snapshot already holds ' + D.live_size + ' protocols whose token trades, so the market has told us what it pays per dollar of TVL in each category. This board reads that ratio, shrinks it toward the market median where a category is thin, applies it to the <b>' + D.rows.length + ' protocols that record no token</b>, weights each by the odds its age cohort launches at all, and then says what farming it costs and how long it ties the money up.</p>' +
+          '<p class="lede">' + D.backtest.n + ' protocols in the snapshot already trade, so the market has already priced a dollar of TVL — and it prices it at ' + D.curve.b.toFixed(2) + ' of a dollar per dollar, not one. This board fits that curve, applies it to the <b>' + D.rows.length + ' protocols that record no token</b>, weights each by the odds its age cohort launches at all, and then says what farming it costs and how long it ties the money up. Held out one at a time, the fit lands within ' + D.backtest.model_factor.toFixed(1) + '× of the market’s answer against ' + D.backtest.flat_factor.toFixed(1) + '× for one flat median.</p>' +
         '</div>' +
         '<div class="stats">' +
           '<div class="stat"><div class="k">Watchlist</div><div class="v">' + D.watchlist_size + '<small> / ' + D.watchlist_size + '</small></div></div>' +
           '<div class="stat"><div class="k">Rows</div><div class="v">' + D.rows.length + '</div></div>' +
-          '<div class="stat"><div class="k">Categories</div><div class="v">' + D.category_count + '<small> / ' + D.category_total + '</small></div></div>' +
-          '<div class="stat"><div class="k">Median</div><div class="v">' + mult(D.market_median_multiple) + '</div></div>' +
+          '<div class="stat"><div class="k">Typical miss</div><div class="v">' + D.backtest.model_factor.toFixed(1) + '<small>× vs ' + D.backtest.flat_factor.toFixed(1) + ' flat</small></div></div>' +
+          '<div class="stat"><div class="k">Fitted slope</div><div class="v">' + D.curve.b.toFixed(2) + '<small> n=' + D.curve.n + '</small></div></div>' +
         '</div>' +
       '</section>' +
       '<div class="formula">' +
-        '<strong>Implied value</strong><span class="op">=</span>TVL<span class="op">\u00d7</span>category multiple' +
-        '<span class="op">\u00d7</span>growth<span class="op">\u00d7</span>maturity<span class="op">\u00d7</span>scale<span class="op">\u00d7</span>chains' +
+        '<strong>Implied value</strong><span class="op">=</span>fitted curve(TVL)<span class="op">\u00d7</span>growth<span class="op">\u00d7</span>maturity<span class="op">\u00d7</span>chains' +
         '<span class="op">|</span><strong>Expected</strong><span class="op">=</span>implied<span class="op">\u00d7</span>launch odds' +
         '<span class="note">' + usd(totalImplied) + ' implied across the board \u00b7 median launch odds ' + pct(medianOdds) + '</span>' +
       '</div>';
@@ -132,8 +131,9 @@
         '</div>';
     }).join('');
     return '<section class="strip">' +
-      '<div class="strip-head"><h2>What the market pays per dollar of TVL, by category</h2>' +
-      '<span class="hint">' + priced.length + ' categories with a trading member \u00b7 grey bar: priced on fewer than 3 peers, so pulled hardest toward the ' + mult(D.market_median_multiple) + ' median</span></div>' +
+      '<div class="strip-head"><h2>What each category pays per dollar of TVL \u2014 a diagnostic, not the price</h2>' +
+      '<span class="hint">' + priced.length + ' categories with a trading member \u00b7 not the price: a category\u2019s residual made the held-out miss worse (' +
+      D.backtest.category_factor.toFixed(1) + '\u00d7 vs ' + D.backtest.model_factor.toFixed(1) + '\u00d7), so the curve prices and this table diagnoses</span></div>' +
       '<div class="cats">' + cells + '</div>' +
       '</section>';
   }
@@ -188,13 +188,13 @@
     return '<thead><tr>' +
       th('rank', 'Rank') +
       '<th>Protocol</th>' +
-      th('multiple', 'Category multiple') +
+      th('multiple', 'Fitted multiple') +
       th('tvl', 'TVL', 1) +
       th('growth', '7d', 1) +
       th('age', 'No-token age', 1) +
       th('odds', 'Launch odds', 1) +
       th('implied', 'Implied value', 1) +
-      '<th class="num">Middle half</th>' +
+      '<th class="num">Typical band</th>' +
       th('expected', 'Expected', 1) +
       '<th>Farm</th>' +
       '</tr></thead>';
@@ -203,13 +203,12 @@
   function row(r) {
     var tags = '';
     if (r.watchlisted) tags += '<span class="tag onlist">watchlist</span>';
-    if (r.samples < 3) tags += '<span class="tag thin">thin category</span>';
     var w = Math.max(2, r.odds * 100);
     return '<tr data-slug="' + esc(r.slug) + '">' +
       '<td class="rank">' + r.rank + '</td>' +
       '<td class="proto"><div class="nm">' + esc(r.name) + tags + '</div>' +
         '<div class="sub">' + esc(r.category || 'uncategorised') + ' \u00b7 ' + esc(r.chains.slice(0, 3).join(', ')) + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</div></td>' +
-      '<td class="num">' + mult(r.multiple) + ' <span class="rng">n=' + r.samples + '</span></td>' +
+      '<td class="num">' + mult(r.multiple) + '</td>' +
       '<td class="num">' + usd(r.tvl_usd) + '</td>' +
       '<td class="num">' + growth(r.change_7d) + '</td>' +
       '<td class="num">' + age(r.age_days) + '</td>' +
@@ -296,7 +295,7 @@
     var m = r.model || {};
     var band = cohortFor(r.age_days === null ? D.model.unknown_age_days : r.age_days);
     var catFactor = (r.odds / band.rate).toFixed(2);
-    var recomputed = Math.round(r.tvl_usd * r.multiple * r.growth_multiplier * r.maturity_multiplier * r.scale_multiplier * r.chain_multiplier);
+    var recomputed = Math.round(r.tvl_usd * r.multiple * r.growth_multiplier * r.maturity_multiplier * r.chain_multiplier);
 
     where.innerHTML = '<a href="#/">Board</a><span class="sep">/</span><span>' + esc(r.name) + '</span>';
 
@@ -305,7 +304,6 @@
       ['\u00d7 Multiple', mult(r.multiple)],
       ['\u00d7 Growth', r.growth_multiplier.toFixed(3)],
       ['\u00d7 Maturity', r.maturity_multiplier.toFixed(3)],
-      ['\u00d7 Scale', r.scale_multiplier.toFixed(3)],
       ['\u00d7 Chains', r.chain_multiplier.toFixed(3)]
     ].map(function (c) {
       return '<div class="step-cell"><div class="k">' + c[0] + '</div><div class="v">' + c[1] + '</div></div>';
@@ -341,13 +339,13 @@
             '<div class="chain-of">' + cells +
               '<div class="step-cell result"><div class="k">= Implied</div><div class="v">' + usd(r.implied_value_usd) + '</div></div>' +
             '</div>' +
-            '<p class="explain">The multiple is <var>' + mult(r.own_multiple) + '</var> from ' + (r.samples === 0 ? 'no peers, so the market median stands alone' :
-              (r.samples === 1 ? 'a single peer' : r.samples + ' peers')) +
-              ', pulled ' + pct(r.borrowed) + ' of the way to the market median <var>' + mult(D.market_median_multiple) + '</var> by <var>buildMultiples</var>: ' +
-              '<var>' + mult(r.multiple) + '</var> is what the board applies. Then <var>impliedValue</var> scales it by the seven-day growth of ' +
+            '<p class="explain">The multiple is <var>' + mult(r.multiple) + '</var> because the market prices TVL at ' + D.curve.b.toFixed(2) +
+              ' of a dollar per dollar and ' + usd(r.tvl_usd) + ' is a large book: <var>multipleAt</var> reads the fitted curve at this size, so the multiple falls as TVL rises. ' +
+              'Then <var>impliedValue</var> corrects it by the seven-day growth of ' +
               (r.change_7d === null ? 'no reported change' : r.change_7d.toFixed(1) + '%') + ', by ' + (r.age_days === null ? 'the assumed' : r.age_days + ' days of') +
-              ' maturity, by the damping a ' + usd(r.tvl_usd) + ' book gets, and by ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + '. ' +
-              'Recomputing those five factors here gives <var>' + usd(recomputed) + '</var>, which is the figure in <var>board.json</var>.</p>' +
+              ' maturity, and by ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's') + '. ' +
+              'Recomputing those factors here gives <var>' + usd(recomputed) + '</var>, which is the figure in <var>board.json</var>. ' +
+              'The band is the backtest\u2019s own miss: on ' + D.backtest.n + ' held-out protocols this model lands within ' + D.backtest.model_factor.toFixed(1) + '\u00d7, so a single number would overstate what is known.</p>' +
           '</div>' +
         '</section>' +
 
@@ -379,7 +377,8 @@
           '</div>' +
           '<ol class="steps">' + steps + '</ol>' +
           '<p class="explain">The verdict is a stated policy, not a promise: <var>farmEconomics</var> farms a protocol whose odds clear ' + pct(D.model.farm_odds) +
-            ' and whose implied value clears ' + usd(D.model.farm_min_implied_usd) + ', watches one where either is half true, and skips a protocol whose TVL fell 20% or more in seven days.</p>' +
+            ' and whose implied value clears ' + usd(D.model.farm_min_implied_usd) + ', watches one that clears ' + pct(D.model.watch_odds) + ' or ' + usd(D.model.watch_min_implied_usd) +
+            ', and skips the rest and anything whose TVL fell 20% or more in seven days.</p>' +
         '</div>' +
       '</section>' + foot();
 
@@ -420,15 +419,19 @@
         'and no category\u2019s multiple is typed in by hand.</p>' +
       '</div>' +
       '<div class="mlist">' +
-        '<div class="mitem"><h3>The multiple: what the market pays per dollar of TVL</h3>' +
-          '<p>' + D.live_size + ' protocols in the snapshot already trade, so each carries both a TVL and a market cap. Their ratio is the market\u2019s own price for that category\u2019s TVL. ' +
-          'Entries whose name carries a version marker are dropped (a pool\u2019s TVL against a protocol\u2019s cap reads 19\u00d7 where the protocol is 0.2\u00d7), ' +
-          'and so is anything under ' + usd(D.model.sample_tvl_floor) + ' of TVL. The rest are winsorised to [' + D.model.ratio_floor + ', ' + D.model.ratio_ceiling + '] so one outlier cannot move a sector.</p></div>' +
-        '<div class="mitem"><h3>The shrinkage: a thin category borrows from the market</h3>' +
-          '<p>A category with one trading member is a sample, not a price. Rather than price every thin category at the same market median \u2014 which hides exactly the difference a reader came for \u2014 each category\u2019s median is pulled toward the market median in log space, by ' + D.model.shrink_k + ' pseudo-observations:</p>' +
-          '<code>multiple(cat) = (n \u00b7 log median(cat) + k \u00b7 log market median) / (n + k)</code>' +
-          '<span class="worked">one peer at 2.97\u00d7, market median ' + mult(D.market_median_multiple) + ': 2.97^(1/4) \u00d7 ' + D.market_median_multiple + '^(3/4) = ' + mult(Math.exp((1 * Math.log(2.97) + 3 * Math.log(D.market_median_multiple)) / 4)) + '</span>' +
-          '<p>Ratios multiply, so the pull is geometric: one observation moves a category without setting it. The board\u2019s \u201cn=\u201d is that category\u2019s count of trading peers, and the table below shows how much of every multiple the market median supplied.</p></div>' +
+        '<div class="mitem"><h3>The price: a curve fitted on what already trades</h3>' +
+          '<p>' + D.backtest.n + ' protocols carry both a TVL and a market cap, so each is one observation of what the market pays for a dollar of TVL. It does not pay one dollar: a $2B book is not worth twice a $1B book. Fitting log(market cap) on log(TVL) over those protocols gives the slope ' +
+          D.curve.b.toFixed(3) + ' directly from the snapshot, so the implied multiple falls with size on its own and no damping term has to be assumed. A protocol\u2019s multiple is that curve read at its own TVL, divided by the TVL.</p>' +
+          '<code>implied multiple(tvl) = exp(a + b \u00b7 log tvl) / tvl,  a = ' + D.curve.a.toFixed(4) + ', b = ' + D.curve.b.toFixed(3) + '</code>' +
+          '<span class="worked">' + usd(2753981495) + ' of TVL → ' + mult(D.rows[0].multiple) + ' · ' + usd(90000000) + ' → ' + mult(D.rows.find(function (r) { return r.tvl_usd < 95000000; }) ? D.rows.find(function (r) { return r.tvl_usd < 95000000; }).multiple : D.rows[D.rows.length - 1].multiple) + '</span>' +
+          '</div>' +
+        '<div class="mitem"><h3>The test it has to pass: held out, one protocol at a time</h3>' +
+          '<p>Every protocol is priced by a curve fitted without it, then compared with the market cap the market actually gave it. The typical miss is exp(median |log miss|), so ' + D.backtest.model_factor.toFixed(2) + ' means the estimate lands within that factor on the typical protocol. One flat market median, the model this board replaces, misses by ' + D.backtest.flat_factor.toFixed(2) + '. ' +
+          pct(D.backtest.model_wins) + ' of held-out protocols are priced closer by this fit.</p>' +
+          '<p>The category layer was tested the same way, and dropped: adding each category\u2019s own residual to the curve makes the typical miss <b>' + D.backtest.category_factor.toFixed(2) + '</b> instead of ' + D.backtest.model_factor.toFixed(2) +
+          '. A category\u2019s price is mostly its size in disguise, so the board keeps the category table as a diagnostic of what the curve sets aside, and prices from the curve alone.</p>' +
+          '<span class="worked">measured on ' + D.backtest.n + ' trading protocols: fit ' + D.backtest.model_factor.toFixed(2) + ' \u00b7 flat median ' + D.backtest.flat_factor.toFixed(2) + ' \u00b7 fit + category ' + D.backtest.category_factor.toFixed(2) + '</span>' +
+          '</div>' +
         '<div class="mitem"><h3>The odds: how often a protocol like this one launches</h3>' +
           '<p>' + D.odds_model.with_token + ' of the ' + D.odds_model.counted + ' dated protocols in the snapshot record a token. That base rate of ' + pct(D.odds_model.base_rate) +
           ' rises with age \u2014 the oldest cohort converts several times as often as the youngest \u2014 so each protocol takes its own age cohort\u2019s rate, pulled toward the base rate, then multiplied by how much more or less often its category converts. ' +
@@ -442,13 +445,13 @@
           'A protocol priced off one peer shows a wide band on purpose: that band is the honest width of what one observation knows.</p></div>' +
         '<div class="mitem"><h3>The decision: what farming costs, and whether it is worth it</h3>' +
           '<p>The deposit scales with the protocol\u2019s TVL, gas accumulates weekly over the hold, and the hold itself lengthens for younger protocols that need more snapshots to qualify. ' +
-          'The verdict reads the two numbers the model produced: a farm needs odds of ' + pct(D.model.farm_odds) + ' and an implied value of ' + usd(D.model.farm_min_implied_usd) + ', a watch needs half of either, and a 20% weekly TVL fall skips. ' +
+          'The verdict reads the two numbers the model produced: a farm needs odds of ' + pct(D.model.farm_odds) + ' and an implied value of ' + usd(D.model.farm_min_implied_usd) + ', a watch needs ' + pct(D.model.watch_odds) + ' or ' + usd(D.model.watch_min_implied_usd) + ', and a 20% weekly TVL fall skips. ' +
           'What a position captures depends on the protocol\u2019s own points programme, which the snapshot does not carry, so no dollar payoff is claimed anywhere.</p></div>' +
       '</div>' +
 
       '<div class="grid2" style="margin-top:22px">' +
         '<section class="card"><h2>Every category the snapshot prices</h2><div class="body" style="padding:0">' +
-          '<table class="small"><thead><tr><th>Category</th><th class="num">Own median</th><th class="num">Peers</th><th class="num">Borrowed</th><th class="num">Applied</th><th class="num">Middle half</th></tr></thead>' +
+          '<table class="small"><thead><tr><th>Category (diagnostic)</th><th class="num">Own median</th><th class="num">Peers</th><th class="num">Borrowed</th><th class="num">Shrunk</th><th class="num">Middle half</th></tr></thead>' +
           '<tbody>' + catRows + '</tbody></table></div></section>' +
         '<section class="card"><h2>The odds cohorts</h2><div class="body" style="padding:0">' +
           '<table class="small"><thead><tr><th>Age cohort</th><th class="num">Protocols</th><th class="num">With a token</th><th class="num">Rate</th></tr></thead>' +

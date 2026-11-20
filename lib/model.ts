@@ -70,8 +70,6 @@ export interface ModelConstants {
   maturity_range: number;
   maturity_days: number;
   unknown_age_days: number;
-  scale_damping: number;
-  scale_ref_usd: number;
   chain_premium: number;
   chain_cap: number;
   /** Pre-token odds: pseudo-counts pulling a cohort's and a category's rate to the base rate. */
@@ -92,6 +90,7 @@ export interface ModelConstants {
   farm_odds: number;
   watch_odds: number;
   farm_min_implied_usd: number;
+  watch_min_implied_usd: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -103,8 +102,6 @@ export const MODEL: ModelConstants = {
   maturity_range: 0.35,
   maturity_days: 1460,
   unknown_age_days: 365,
-  scale_damping: 0.1,
-  scale_ref_usd: 100_000_000,
   chain_premium: 0.04,
   chain_cap: 5,
   odds_cohort_k: 8,
@@ -115,13 +112,14 @@ export const MODEL: ModelConstants = {
   ratio_floor: 0.02,
   ratio_ceiling: 3,
   global_fallback: 0.2,
-  farm_odds: 0.35,
-  watch_odds: 0.2,
-  farm_min_implied_usd: 50_000_000,
+  farm_odds: 0.3,
+  watch_odds: 0.25,
+  farm_min_implied_usd: 15_000_000,
+  watch_min_implied_usd: 30_000_000,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'crosssection-3';
+export const MODEL_VERSION = 'fitted-4';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -204,16 +202,11 @@ export interface BoardRow {
   odds: number;
   expected_value_usd: number;
   model: {
-    category_multiple: number;
-    category_own_multiple: number;
-    category_samples: number;
-    category_borrowed: number;
-    category_low: number;
-    category_high: number;
+    /** The multiple the curve gives a protocol of this TVL. */
+    multiple: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
-    scale_multiplier: number;
     chain_multiplier: number;
     age_days: number | null;
   };
@@ -241,15 +234,40 @@ export interface RadarRow {
   odds: number;
   expected_value_usd: number;
   multiple: number;
-  own_multiple: number;
-  borrowed: number;
-  samples: number;
   growth_multiplier: number;
   maturity_multiplier: number;
-  scale_multiplier: number;
   chain_multiplier: number;
   farm: FarmEconomics;
   farm_steps: string[];
+}
+
+/**
+ * The model checked against the protocols that already trade: each one is priced by a multiple
+ * fitted without it, and the miss is the factor by which its real market cap differs. The flat
+ * baseline is the same test with one market-wide median. A typical miss is exp(median |log miss|),
+ * so 2.5 means the estimate is within 2.5x on the typical protocol.
+ */
+export interface Backtest {
+  /** Trading protocols the test could price, one at a time. */
+  n: number;
+  /** Typical miss of the fitted curve: exp(median |log(predicted / actual)|). */
+  model_factor: number;
+  /** Typical miss of one flat market median over the same protocols. */
+  flat_factor: number;
+  /** Typical miss when a category's own residual is added to the curve: the option this board drops. */
+  category_factor: number;
+  /** Share of those protocols the fitted curve prices closer than the flat median. */
+  model_wins: number;
+}
+
+/** The curve the board prices from: market cap against TVL, fitted in log space. */
+export interface Curve {
+  /** Intercept of log(market cap) on log(TVL). */
+  a: number;
+  /** Slope: how much a dollar of TVL buys, in market cap, as size grows. */
+  b: number;
+  /** Trading protocols the fit used. */
+  n: number;
 }
 
 /** A live-token protocol: it already trades, so its market cap is a fact, not a model. */
@@ -279,6 +297,8 @@ export interface RadarData {
   category_count: number;
   category_total: number;
   odds_model: OddsModel;
+  curve: Curve;
+  backtest: Backtest;
   rows: RadarRow[];
   live: LiveRow[];
   multiples: MultipleRow[];
@@ -342,6 +362,44 @@ const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 /** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool. */
 export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
+}
+
+/**
+ * The market's own price for a dollar of TVL, fitted rather than assumed.
+ *
+ * Market cap does not track TVL one for one: a $2B book is not worth twice a $1B book, so the
+ * ratio mcap/TVL falls as TVL rises. Fitting log(market cap) on log(TVL) over the protocols that
+ * already trade gives that slope directly from the snapshot, and the fit is what the board prices
+ * with. The implied multiple then falls with size on its own, instead of the damping term this
+ * model used to assume.
+ */
+export function fitCurve(protocols: SnapshotProtocol[], c: ModelConstants = MODEL): Curve {
+  const sample = protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd >= c.sample_tvl_floor && !VERSIONED.test(p.name),
+  );
+  if (sample.length < 3) return { a: Math.log(c.global_fallback), b: 1, n: sample.length };
+  const xs = sample.map((p) => Math.log(p.tvl_usd));
+  const ys = sample.map((p) => Math.log(p.mcap_usd!));
+  const mx = xs.reduce((s2, x) => s2 + x, 0) / xs.length;
+  const my = ys.reduce((s2, y) => s2 + y, 0) / ys.length;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    sxx += (xs[i]! - mx) ** 2;
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+  }
+  const b = sxx > 0 ? sxy / sxx : 1;
+  return { a: round4(my - b * mx), b: round4(b), n: sample.length };
+}
+
+/** The market cap the curve predicts for a protocol of this TVL, in whole dollars. */
+export function curveValue(tvlUsd: number, curve: Curve): number {
+  return Math.exp(curve.a + curve.b * Math.log(Math.max(tvlUsd, 1)));
+}
+
+/** The implied multiple at this TVL: the curve's value over the TVL, so it falls as size grows. */
+export function multipleAt(tvlUsd: number, curve: Curve): number {
+  return round4(curveValue(tvlUsd, curve) / Math.max(tvlUsd, 1));
 }
 
 /**
@@ -449,6 +507,64 @@ export function buildOdds(protocols: SnapshotProtocol[], asOf: string, c: ModelC
   return { base_rate: round4(base), with_token: withToken.length, counted: dated.length, cohorts };
 }
 
+/**
+ * The model's own out-of-sample test, on the only protocols whose answer is known.
+ *
+ * Every protocol that already trades carries both a TVL and a market cap, so its market cap can be
+ * predicted from its TVL and the multiples fitted from the *other* protocols, then compared with
+ * what the market actually paid. The multiple for the held-out protocol's category is refitted
+ * without it (leave-one-out), so the test never scores a number the model was shown.
+ *
+ * The flat baseline runs the same test with one market-wide median, the model this board replaces.
+ * A typical miss of 2.5x against the baseline's 4.0x says the category structure earns its place;
+ * if the two were equal, the board would be claiming a structure it does not have.
+ */
+export function backtest(protocols: SnapshotProtocol[], c: ModelConstants = MODEL): Backtest {
+  const sample = protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd >= c.sample_tvl_floor && !VERSIONED.test(p.name),
+  );
+  if (sample.length < 10) {
+    return { n: sample.length, model_factor: 1, flat_factor: 1, category_factor: 1, model_wins: 0 };
+  }
+  const ratios = new Map<SnapshotProtocol, number>();
+  for (const p of sample) ratios.set(p, clamp(p.mcap_usd! / p.tvl_usd, c.ratio_floor, c.ratio_ceiling));
+
+  const fitted: number[] = [];
+  const flat: number[] = [];
+  const withCategory: number[] = [];
+  let wins = 0;
+
+  for (const held of sample) {
+    const peers = sample.filter((p) => p !== held);
+    const curve = fitCurve(peers, c);
+    const actual = Math.log(held.mcap_usd!);
+    const predicted = curve.a + curve.b * Math.log(held.tvl_usd);
+    const flatMultiple = median([...ratios.values()].filter((_, i) => sample[i] !== held));
+    const flatPredicted = Math.log(held.tvl_usd) + Math.log(flatMultiple);
+
+    // The option the board drops: the held-out protocol's category residual, shrunk like the rest.
+    const residuals = peers.map((p) => Math.log(p.mcap_usd!) - (curve.a + curve.b * Math.log(p.tvl_usd)));
+    const inCategory = peers.map((p, i) => ({ p, r: residuals[i]! })).filter((x) => x.p.category === held.category).map((x) => x.r);
+    const k = c.shrink_k;
+    const adjust = inCategory.length > 0 ? (inCategory.length * median(inCategory)) / (inCategory.length + k) : 0;
+
+    const miss = Math.abs(predicted - actual);
+    const flatMiss = Math.abs(flatPredicted - actual);
+    fitted.push(miss);
+    flat.push(flatMiss);
+    withCategory.push(Math.abs(predicted + adjust - actual));
+    if (miss < flatMiss) wins++;
+  }
+  const factor = (ms: number[]): number => Math.round(Math.exp(median(ms)) * 100) / 100;
+  return {
+    n: sample.length,
+    model_factor: factor(fitted),
+    flat_factor: factor(flat),
+    category_factor: factor(withCategory),
+    model_wins: Math.round((wins / sample.length) * 1000) / 1000,
+  };
+}
+
 /** The category's token conversion rate against the snapshot's, pulled toward 1. */
 function categoryFactor(protocols: SnapshotProtocol[], category: string | null, base: number, c: ModelConstants): number {
   if (category === null) return 1;
@@ -480,62 +596,49 @@ export function oddsFor(
   return round4(clamp(cohort.rate * factor, c.odds_floor, c.odds_ceiling));
 }
 
-/**
- * The category's pricing from the table `buildMultiples` made. A protocol whose category the
- * snapshot never prices a live token in takes the market median, with every dollar borrowed.
- */
-function multipleFor(category: string | null, table: Map<string, MultipleRow>, global: number): MultipleRow {
-  const row = category === null ? undefined : table.get(category);
-  if (row !== undefined) return row;
-  return {
-    category: category ?? 'Uncategorised',
-    own_multiple: global,
-    multiple: global,
-    samples: 0,
-    borrowed: 1,
-    low: global,
-    high: global,
-  };
-}
-
-/** The five multipliers and the implied value one protocol gets. */
+/** The fitted multiple, the three corrections and the implied value one protocol gets. */
 export interface ImpliedResult {
   implied: number;
   low: number;
   high: number;
-  multiple: MultipleRow;
+  multiple: number;
   growthPct: number;
   growthMult: number;
   maturityMult: number;
-  scaleMult: number;
   chainMult: number;
   age: number | null;
 }
 
+/**
+ * The implied value: the curve's price for this TVL, corrected by the record the curve cannot see.
+ *
+ * `miss` is the backtest's typical multiplicative miss, and it sets the band: the row shows what
+ * the number is worth, not a false decimal. A 4x miss means the board's own test says an estimate
+ * of this kind lands within a factor of four on the typical protocol, and the band says so.
+ */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   c: ModelConstants,
-  multiple: MultipleRow,
+  multiple: number,
+  miss: number,
 ): ImpliedResult {
   const age = ageDays(asOf, protocol.listed_at);
   const ageForModel = age ?? c.unknown_age_days;
   const growthPct = clamp(finite(protocol.change_7d, 0), c.growth_floor, c.growth_cap);
   const growthMult = 1 + (growthPct / 100) * c.growth_weight;
   const maturityMult = c.maturity_floor + (clamp(ageForModel, 0, c.maturity_days) / c.maturity_days) * c.maturity_range;
-  const scaleMult = 1 / (1 + c.scale_damping * Math.max(0, Math.log10(Math.max(protocol.tvl_usd, 1) / c.scale_ref_usd)));
   const chainMult = 1 + c.chain_premium * Math.min(Math.max(protocol.chains.length - 1, 0), c.chain_cap);
-  const factors = growthMult * maturityMult * scaleMult * chainMult;
+  const factors = growthMult * maturityMult * chainMult;
   const at = (m: number): number => Math.max(1, Math.round(protocol.tvl_usd * m * factors));
   return {
-    implied: at(multiple.multiple),
-    low: at(multiple.low),
-    high: at(multiple.high),
+    implied: at(multiple),
+    low: at(multiple / Math.max(1, miss)),
+    high: at(multiple * Math.max(1, miss)),
     multiple,
     growthPct,
     growthMult: round4(growthMult),
     maturityMult: round4(maturityMult),
-    scaleMult: round4(scaleMult),
     chainMult: round4(chainMult),
     age,
   };
@@ -567,7 +670,7 @@ export function farmEconomics(p: SnapshotProtocol, age: number | null, implied: 
     ? 'skip'
     : odds >= c.farm_odds && implied >= c.farm_min_implied_usd
       ? 'farm'
-      : odds >= c.watch_odds || implied >= 4 * c.farm_min_implied_usd
+      : odds >= c.watch_odds || implied >= c.watch_min_implied_usd
         ? 'watch'
         : 'skip';
   return {
@@ -585,11 +688,12 @@ export function farmEconomics(p: SnapshotProtocol, age: number | null, implied: 
 export function buildBoard(
   snapshot: Snapshot,
   model: ModelConstants = MODEL,
-): { board: BoardRow[]; multiples: MultipleRow[]; global: number; odds: OddsModel } {
+): { board: BoardRow[]; multiples: MultipleRow[]; global: number; odds: OddsModel; curve: Curve; test: Backtest } {
   const index = bySlug(snapshot.protocols);
   const { rows: multipleRows, global } = buildMultiples(snapshot.protocols, model);
-  const table = new Map(multipleRows.map((m) => [m.category, m]));
   const odds = buildOdds(snapshot.protocols, snapshot.as_of, model);
+  const curve = fitCurve(snapshot.protocols, model);
+  const test = backtest(snapshot.protocols, model);
 
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug on it is covered, whatever else the board carries.
@@ -606,8 +710,8 @@ export function buildBoard(
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const multiple = multipleFor(p.category, table, global);
-    const r = impliedValue(p, snapshot.as_of, model, multiple);
+    const multiple = multipleAt(p.tvl_usd, curve);
+    const r = impliedValue(p, snapshot.as_of, model, multiple, test.model_factor);
     const rowOdds = oddsFor(p, r.age, odds, snapshot.protocols, model);
     return { p, r, rowOdds };
   });
@@ -635,16 +739,10 @@ export function buildBoard(
       odds: s.rowOdds,
       expected_value_usd: farm.expected_value_usd,
       model: {
-        category_multiple: s.r.multiple.multiple,
-        category_own_multiple: s.r.multiple.own_multiple,
-        category_samples: s.r.multiple.samples,
-        category_borrowed: s.r.multiple.borrowed,
-        category_low: s.r.multiple.low,
-        category_high: s.r.multiple.high,
+        multiple: s.r.multiple,
         growth_pct: s.r.growthPct,
         growth_multiplier: s.r.growthMult,
         maturity_multiplier: s.r.maturityMult,
-        scale_multiplier: s.r.scaleMult,
         chain_multiplier: s.r.chainMult,
         age_days: s.r.age,
       },
@@ -652,7 +750,7 @@ export function buildBoard(
       farm_steps: farmSteps(s.p, s.r.age, farm, s.rowOdds, model).map(stepText),
     };
   });
-  return { board, multiples: multipleRows, global, odds };
+  return { board, multiples: multipleRows, global, odds, curve, test };
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
@@ -832,13 +930,9 @@ export function radarRow(row: BoardRow, watchlist: readonly string[]): RadarRow 
     implied_high_usd: row.implied_high_usd,
     odds: row.odds,
     expected_value_usd: row.expected_value_usd,
-    multiple: row.model.category_multiple,
-    own_multiple: row.model.category_own_multiple,
-    borrowed: row.model.category_borrowed,
-    samples: row.model.category_samples,
+    multiple: row.model.multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
-    scale_multiplier: row.model.scale_multiplier,
     chain_multiplier: row.model.chain_multiplier,
     farm: row.farm,
     farm_steps: row.farm_steps,
@@ -847,7 +941,7 @@ export function radarRow(row: BoardRow, watchlist: readonly string[]): RadarRow 
 
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { board, multiples, global, odds } = buildBoard(snapshot, model);
+  const { board, multiples, global, odds, curve, test } = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
@@ -864,6 +958,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     category_count: multiples.filter((m) => m.samples > 0).length,
     category_total: multiples.length,
     odds_model: odds,
+    curve,
+    backtest: test,
     rows: board.map((row) => radarRow(row, snapshot.watchlist)),
     live,
     multiples,
