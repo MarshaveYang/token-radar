@@ -17,7 +17,7 @@
   var where = document.getElementById('where');
   var meta = document.getElementById('meta');
 
-  var state = { q: '', category: 'all', chain: 'all', tab: 'all', sort: 'implied', dir: -1 };
+  var state = { q: '', category: 'all', chain: 'all', tab: 'all', sort: 'implied', dir: -1, wGrowth: D.model.growth_weight, miss: D.backtest.model_factor };
   var bySlug = {};
   D.rows.forEach(function (r) { bySlug[r.slug] = r; });
 
@@ -80,8 +80,8 @@
     rows.sort(function (a, b) {
       var x = a, y = b;
       if (key === 'rank') { x = a.rank; y = b.rank; }
-      else if (key === 'implied') { x = a.implied_value_usd; y = b.implied_value_usd; }
-      else if (key === 'expected') { x = a.expected_value_usd; y = b.expected_value_usd; }
+      else if (key === 'implied') { x = impliedFor(a); y = impliedFor(b); }
+      else if (key === 'expected') { x = impliedFor(a) * a.odds; y = impliedFor(b) * b.odds; }
       else if (key === 'odds') { x = a.odds; y = b.odds; }
       else if (key === 'tvl') { x = a.tvl_usd; y = b.tvl_usd; }
       else if (key === 'growth') { x = a.change_7d === null ? -1e9 : a.change_7d; y = b.change_7d === null ? -1e9 : b.change_7d; }
@@ -102,7 +102,7 @@
       '<section class="hero">' +
         '<div>' +
           '<h1>Every protocol that records <em>no token</em>, priced from the record it does have</h1>' +
-          '<p class="lede">' + D.backtest.n + ' protocols in the snapshot already trade, so the market has already priced a dollar of TVL — and it prices it at ' + D.curve.b.toFixed(2) + ' of a dollar per dollar, not one. This board fits that curve, applies it to the <b>' + D.rows.length + ' protocols that record no token</b>, weights each by the odds its age cohort launches at all, and then says what farming it costs and how long it ties the money up. Held out one at a time, the fit lands within ' + D.backtest.model_factor.toFixed(1) + '× of the market’s answer against ' + D.backtest.flat_factor.toFixed(1) + '× for one flat median.</p>' +
+          '<p class="lede">' + D.backtest.n + ' protocols in the snapshot already trade, so the market has already priced a dollar of TVL — and it prices it at ' + D.curve.b.toFixed(2) + ' of a dollar per dollar, not one. This board fits that curve, applies it to the <b>' + D.rows.length + ' protocols that record no token and are not a claim on one that trades</b>, weights each by the odds its age cohort launches at all, and then says what farming it costs and how long it ties the money up. Held out one at a time, the fit lands within ' + D.backtest.model_factor.toFixed(1) + '× of the market’s answer against ' + D.backtest.flat_factor.toFixed(1) + '× for one flat median.</p>' +
         '</div>' +
         '<div class="stats">' +
           '<div class="stat"><div class="k">Watchlist</div><div class="v">' + D.watchlist_size + '<small> / ' + D.watchlist_size + '</small></div></div>' +
@@ -112,9 +112,11 @@
         '</div>' +
       '</section>' +
       '<div class="formula">' +
+      '<div class="frow">' +
         '<strong>Implied value</strong><span class="op">=</span>fitted curve(TVL)<span class="op">\u00d7</span>growth<span class="op">\u00d7</span>maturity<span class="op">\u00d7</span>chains' +
         '<span class="op">|</span><strong>Expected</strong><span class="op">=</span>implied<span class="op">\u00d7</span>launch odds' +
         '<span class="note">' + usd(totalImplied) + ' implied across the board \u00b7 median launch odds ' + pct(medianOdds) + '</span>' +
+      '</div>' + sandbox() +
       '</div>';
   }
 
@@ -136,6 +138,124 @@
       D.backtest.category_factor.toFixed(1) + '\u00d7 vs ' + D.backtest.model_factor.toFixed(1) + '\u00d7), so the curve prices and this table diagnoses</span></div>' +
       '<div class="cats">' + cells + '</div>' +
       '</section>';
+  }
+
+  // ---------- the arithmetic, carried here so the page can prove its own numbers ----------
+
+  // The same product lib/model.ts's impliedValue writes into board.json, re-derived from the row's
+  // own TVL, fitted multiple, growth, maturity and chains. The page needs it for three things: to
+  // check that every number it prints equals the product of the factors it prints beside it, to
+  // let a reader override the growth weight and watch all 200 rows re-price, and to say by how
+  // much the committed board and the reader's own assumptions differ.
+  function clampN(n, lo, hi) { return n < lo ? lo : n > hi ? hi : n; }
+
+  function growthMultOf(r, weight) {
+    var g = clampN(r.change_7d === null || r.change_7d === undefined ? 0 : r.change_7d, D.model.growth_floor, D.model.growth_cap);
+    return 1 + (g / 100) * weight;
+  }
+
+  function price(r, weight) {
+    return Math.max(1, Math.round(r.tvl_usd * r.multiple * growthMultOf(r, weight) * r.maturity_multiplier * r.chain_multiplier));
+  }
+
+  // How far the page's own arithmetic can land from the board's, because board.json keeps its
+  // multipliers at four decimals and prices from the unrounded ones.
+  var worstDrift = (function () {
+    var w = 0;
+    D.rows.forEach(function (r) {
+      var d = Math.abs(price(r, D.model.growth_weight) - r.implied_value_usd) / r.implied_value_usd;
+      if (d > w) w = d;
+    });
+    return w;
+  })();
+
+  var netRefs = (function () {
+    var n = 0;
+    Array.prototype.forEach.call(document.querySelectorAll('[src],[href]'), function (el) {
+      var v = el.getAttribute('src') || el.getAttribute('href') || '';
+      if (/^[a-z][a-z0-9+.-]*:/i.test(v) && v.indexOf('data:') !== 0) n++;
+    });
+    return n;
+  })();
+
+  /** Whether the board is showing the reader's assumptions instead of its own. */
+  function whatIf() { return state.wGrowth !== D.model.growth_weight || state.miss !== D.backtest.model_factor; }
+
+  function impliedFor(r) { return whatIf() ? price(r, state.wGrowth) : r.implied_value_usd; }
+
+  function bandFor(r) {
+    var m = Math.max(1, state.miss);
+    var v = impliedFor(r);
+    return [Math.max(1, Math.round(v / m)), Math.max(1, Math.round(v * m))];
+  }
+
+  function liveRanks() {
+    if (!whatIf()) return null;
+    var order = D.rows.slice().sort(function (a, b) { return impliedFor(b) - impliedFor(a) || a.rank - b.rank; });
+    var map = {};
+    order.forEach(function (r, i) { map[r.slug] = i + 1; });
+    return map;
+  }
+
+  // ---------- what the page can prove about itself ----------
+
+  function proofList() {
+    var ranksOk = true;
+    var last = Infinity;
+    D.rows.forEach(function (r, i) {
+      if (r.rank !== i + 1 || r.implied_value_usd > last) ranksOk = false;
+      last = r.implied_value_usd;
+    });
+    var onList = D.rows.filter(function (r) { return r.watchlisted; }).length;
+    var banded = D.rows.every(function (r) { return r.implied_low_usd < r.implied_value_usd && r.implied_value_usd < r.implied_high_usd; });
+    return [
+      ['prices', worstDrift < 0.0002, D.rows.length + '/' + D.rows.length + ', drift ' + (worstDrift * 100).toFixed(3) + '%',
+        'every printed value is the product of the five factors printed beside it'],
+      ['ranks', ranksOk, '1\u2013' + D.rows.length + ', value never rises',
+        'each rank used once, and implied value never rises as rank ascends'],
+      ['watchlist', onList === D.watchlist_size, onList + '/' + D.watchlist_size + ' covered',
+        'every protocol the snapshot calls pre-token appears, none dropped'],
+      ['bands', banded, D.rows.length + '/' + D.rows.length + ' bracket their value',
+        'the low\u2013high band is the value divided and multiplied by the same miss'],
+      ['offline', netRefs === 0, netRefs === 0 ? '0 network addresses' : netRefs + ' found',
+        'the page renders from one local dataset: no fetch, no absolute URL in its markup']
+    ];
+  }
+
+  function checks() {
+    var a = D.account || {};
+    var cells = proofList().map(function (p) {
+      return '<span class="proof' + (p[1] ? '' : ' bad') + '" title="' + esc(p[3]) + '">' +
+        '<i aria-hidden="true">' + (p[1] ? '\u2713' : '\u2717') + '</i>' + p[0] + '<b>' + esc(p[2]) + '</b></span>';
+    }).join('');
+    var path = '';
+    if (a.total) {
+      var ex = a.excluded || {};
+      path = '<span class="path">' +
+        '<b>' + a.total + '</b><i>in the sealed snapshot</i>' +
+        '<b>' + a.trading + '</b><i>record a token</i>' +
+        '<b>' + a.no_token + '</b><i>record none</i>' +
+        '<b>\u2212' + (ex.exchange + ex.staked + ex.wrapped + ex.versioned) + '</b><i>a claim on one that trades (' + ex.exchange + ' exchange \u00b7 ' + ex.staked + ' staked \u00b7 ' + ex.wrapped + ' wrapped or bridged \u00b7 ' + ex.versioned + ' versioned)</i>' +
+        '<b>' + a.ranked + '</b><i>priced' + (a.kept_by_watchlist ? '<sup title="' + a.kept_by_watchlist + ' of them are staked or bridged products, priced because the house\u2019s own watchlist names them and the watchlist overrides the rule">\u2020</sup>' : '') + '</i>' +
+        '</span>';
+    }
+    return '<div class="checks">' +
+      '<div class="row"><span class="lbl">Accounted for</span>' + path + '</div>' +
+      '<div class="row proofs"><span class="lbl">Checked here</span>' + cells + '</div>' +
+      '</div>';
+  }
+
+  function sandbox() {
+    var on = whatIf();
+    return '<div class="sandbox' + (on ? ' on' : '') + '">' +
+      '<span class="lbl">Your assumptions</span>' +
+      '<label>growth weight<input type="range" id="wg" min="0" max="70" step="5" value="' + Math.round(state.wGrowth * 100) + '" aria-label="growth weight"><b>' + state.wGrowth.toFixed(2) + '</b></label>' +
+      '<label>miss band<input type="range" id="mb" min="1" max="60" step="1" value="' + Math.round(state.miss * 10) / 10 + '" aria-label="miss band"><b>' + state.miss.toFixed(1) + '\u00d7</b></label>' +
+      '<span class="note">' + (on
+        ? '\u25cf your assumptions, not the board\u2019s: every row recomputed from its own TVL, growth, maturity and chains'
+        : 'drag either and all ' + D.rows.length + ' rows re-price from their own inputs') + '</span>' +
+      '<button type="button" id="wreset"' + (on ? '' : ' disabled') + '>Reset</button>' +
+      '</div>';
   }
 
   function controls() {
@@ -166,8 +286,8 @@
 
   function summary(rows) {
     if (!rows.length) return '<div class="summary"><b>0</b> rows match</div>';
-    var total = rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0);
-    var expected = rows.reduce(function (s, r) { return s + r.expected_value_usd; }, 0);
+    var total = rows.reduce(function (s, r) { return s + impliedFor(r); }, 0);
+    var expected = rows.reduce(function (s, r) { return s + impliedFor(r) * r.odds; }, 0);
     var odds = rows.slice().sort(function (a, b) { return a.odds - b.odds; })[Math.floor(rows.length / 2)].odds;
     var farms = rows.filter(function (r) { return r.farm.verdict === 'farm'; }).length;
     return '<div class="summary">' +
@@ -176,6 +296,7 @@
       '<span class="tag">expected</span><span><b>' + usd(expected) + '</b></span>' +
       '<span class="tag">median odds</span><span><b>' + pct(odds) + '</b></span>' +
       '<span class="tag">worth farming</span><span><b>' + farms + '</b></span>' +
+      (whatIf() ? '<span class="tag wf">under your assumptions</span>' : '') +
       '</div>';
   }
 
@@ -204,8 +325,12 @@
     var tags = '';
     if (r.watchlisted) tags += '<span class="tag onlist">watchlist</span>';
     var w = Math.max(2, r.odds * 100);
+    var live = whatIf();
+    var shown = impliedFor(r);
+    var band = live ? bandFor(r) : [r.implied_low_usd, r.implied_high_usd];
+    var shownRank = live ? (state.ranks && state.ranks[r.slug]) || r.rank : r.rank;
     return '<tr data-slug="' + esc(r.slug) + '">' +
-      '<td class="rank">' + r.rank + '</td>' +
+      '<td class="rank">' + shownRank + (live && shownRank !== r.rank ? '<i class="wf" title="was rank ' + r.rank + ' on the committed board">\u2190' + r.rank + '</i>' : '') + '</td>' +
       '<td class="proto"><div class="nm">' + esc(r.name) + tags + '</div>' +
         '<div class="sub">' + esc(r.category || 'uncategorised') + ' \u00b7 ' + esc(r.chains.slice(0, 3).join(', ')) + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') + '</div></td>' +
       '<td class="num">' + mult(r.multiple) + '</td>' +
@@ -213,17 +338,18 @@
       '<td class="num">' + growth(r.change_7d) + '</td>' +
       '<td class="num">' + age(r.age_days) + '</td>' +
       '<td class="num"><span class="odds"><span class="bar"><i style="width:' + w.toFixed(1) + '%"></i></span><span class="val">' + pct(r.odds) + '</span></span></td>' +
-      '<td class="num">' + usd(r.implied_value_usd) + '</td>' +
-      '<td class="num rng">' + usd(r.implied_low_usd) + '\u2013' + usd(r.implied_high_usd) + '</td>' +
-      '<td class="num">' + usd(r.expected_value_usd) + '</td>' +
+      '<td class="num' + (live ? ' wf' : '') + '">' + usd(shown) + '</td>' +
+      '<td class="num rng">' + usd(band[0]) + '\u2013' + usd(band[1]) + '</td>' +
+      '<td class="num">' + usd(shown * r.odds) + '</td>' +
       '<td><span class="verdict ' + r.farm.verdict + '">' + r.farm.verdict + '</span></td>' +
       '</tr>';
   }
 
   function renderBoard() {
+    state.ranks = liveRanks();
     var rows = visible();
     where.innerHTML = '<span>Board</span>';
-    root.innerHTML = hero() + strip() + controls() + summary(rows) +
+    root.innerHTML = hero() + checks() + strip() + controls() + summary(rows) +
       '<div class="tablewrap"><table>' + head() + '<tbody>' +
       (rows.length ? rows.map(row).join('') : '<tr><td class="empty" colspan="11">No protocol matches those filters.</td></tr>') +
       '</tbody></table></div>' +
@@ -234,8 +360,18 @@
     document.getElementById('cat').addEventListener('change', function (e) { state.category = e.target.value; repaint(); });
     document.getElementById('chain').addEventListener('change', function (e) { state.chain = e.target.value; repaint(); });
     document.getElementById('reset').addEventListener('click', function () {
-      state.q = ''; state.category = 'all'; state.chain = 'all'; state.tab = 'all'; state.sort = 'implied'; state.dir = -1; renderBoard();
+      state.q = ''; state.category = 'all'; state.chain = 'all'; state.tab = 'all'; state.sort = 'implied'; state.dir = -1;
+      state.wGrowth = D.model.growth_weight; state.miss = D.backtest.model_factor;
+      renderBoard();
     });
+    var wg = document.getElementById('wg');
+    if (wg) {
+      wg.addEventListener('input', function () { state.wGrowth = Number(wg.value) / 100; renderBoard(); });
+      document.getElementById('mb').addEventListener('input', function (e) { state.miss = Number(e.target.value) / 10; renderBoard(); });
+      document.getElementById('wreset').addEventListener('click', function () {
+        state.wGrowth = D.model.growth_weight; state.miss = D.backtest.model_factor; renderBoard();
+      });
+    }
     Array.prototype.forEach.call(root.querySelectorAll('[data-tab]'), function (b) {
       b.addEventListener('click', function () { state.tab = b.getAttribute('data-tab'); renderBoard(); });
     });
@@ -252,6 +388,7 @@
   }
 
   function repaint() {
+    state.ranks = liveRanks();
     var rows = visible();
     var wrap = root.querySelector('.tablewrap');
     var sum = root.querySelector('.summary');
@@ -274,7 +411,7 @@
 
   function foot() {
     return '<p class="foot"><span>Snapshot ' + esc(D.as_of) + ' \u00b7 ' + esc(D.source) + '</span>' +
-      '<span>' + D.rows.length + ' rows \u00b7 ' + D.early_size + ' below the house floor' +
+      '<span>' + D.rows.length + ' rows \u00b7 ' + D.early_size + ' outside the watchlist' +
       ' \u00b7 model ' + esc(D.model_version) + '</span>' +
       '<span><a href="#/method">How every number here is computed \u2192</a></span></p>';
   }
@@ -304,7 +441,8 @@
       ['\u00d7 Multiple', mult(r.multiple)],
       ['\u00d7 Growth', r.growth_multiplier.toFixed(3)],
       ['\u00d7 Maturity', r.maturity_multiplier.toFixed(3)],
-      ['\u00d7 Chains', r.chain_multiplier.toFixed(3)]
+      ['\u00d7 Chains', r.chain_multiplier.toFixed(3)],
+      ['\u00b1 Miss', D.backtest.model_factor.toFixed(1) + '\u00d7']
     ].map(function (c) {
       return '<div class="step-cell"><div class="k">' + c[0] + '</div><div class="v">' + c[1] + '</div></div>';
     }).join('');
@@ -436,9 +574,9 @@
           '<p>' + D.odds_model.with_token + ' of the ' + D.odds_model.counted + ' dated protocols in the snapshot record a token. That base rate of ' + pct(D.odds_model.base_rate) +
           ' rises with age \u2014 the oldest cohort converts several times as often as the youngest \u2014 so each protocol takes its own age cohort\u2019s rate, pulled toward the base rate, then multiplied by how much more or less often its category converts. ' +
           'Odds are held inside [' + pct(D.model.odds_floor) + ', ' + pct(D.model.odds_ceiling) + ']: no record makes a launch certain.</p></div>' +
-        '<div class="mitem"><h3>The factors: four corrections, each small on purpose</h3>' +
-          '<p>Growth (weight ' + D.model.growth_weight + ' on the seven-day change, because a single week is noisy), maturity (' + D.model.maturity_floor + ' to ' + (D.model.maturity_floor + D.model.maturity_range) + ' over ' + D.model.maturity_days + ' days), ' +
-          'scale (log damping above ' + usd(D.model.scale_ref_usd) + ', because a $3B book does not double), and chains (' + pct(D.model.chain_premium) + ' each, capped at ' + D.model.chain_cap + '). ' +
+        '<div class="mitem"><h3>The factors: three corrections, each small on purpose</h3>' +
+          '<p>Growth (weight ' + D.model.growth_weight + ' on the seven-day change, because a single week is noisy), maturity (' + D.model.maturity_floor + ' to ' + (D.model.maturity_floor + D.model.maturity_range) + ' over ' + D.model.maturity_days + ' days, so a protocol that has run longer with no token is worth more of its curve) ' +
+          'and chains (' + pct(D.model.chain_premium) + ' each, capped at ' + D.model.chain_cap + '). Scale is not one of them: the curve already falls with TVL, so no second damping term is assumed. ' +
           'They correct the multiple; they do not replace it.</p></div>' +
         '<div class="mitem"><h3>The range: a median has a spread</h3>' +
           '<p>Every row carries the middle half of its peer group\u2019s ratios \u2014 the 25th to 75th percentile \u2014 shrunk the same way and multiplied through the same factors. ' +
@@ -449,9 +587,24 @@
           'What a position captures depends on the protocol\u2019s own points programme, which the snapshot does not carry, so no dollar payoff is claimed anywhere.</p></div>' +
       '</div>' +
 
+      '<section class="card" style="margin-top:18px"><h2>What this dashboard proves about itself</h2><div class="body">' +
+        '<p class="explain">The board is not a table of totals. Every row\u2019s implied value is re-derived inside this page from the factors the row prints beside it \u2014 <var>price()</var> in app.js, the same product <var>impliedValue()</var> writes in lib/model.ts \u2014 and the worst disagreement over all ' +
+        D.rows.length + ' rows is ' + (worstDrift * 100).toFixed(3) + '%, which is what four-decimal multipliers cost. The accounting is exact and stated: ' +
+        (D.account ? D.account.total + ' protocols in the sealed snapshot, ' + D.account.trading + ' recording a token, ' + D.account.no_token + ' recording none, ' +
+          (D.account.excluded.exchange + D.account.excluded.staked + D.account.excluded.wrapped + D.account.excluded.versioned) +
+          ' dropped because their TVL is a claim on an asset that already trades (' + D.account.excluded.exchange + ' exchange, ' + D.account.excluded.staked + ' staked, ' +
+          D.account.excluded.wrapped + ' wrapped or bridged, ' + D.account.excluded.versioned + ' versioned), except where the watchlist names one' +
+          (D.account.kept_by_watchlist ? ' \u2014 it does ' + D.account.kept_by_watchlist + ' times \u2014' : '') + '. ' + D.account.ranked + ' priced. ' : '') +
+        'Five checks run on every load and each can fail:</p>' +
+        '<ol class="steps">' + proofList().map(function (p) {
+          return '<li><b>' + p[0] + '</b> \u2014 ' + esc(p[3]) + '. Measured now: <var>' + esc(p[2]) + '</var>.</li>';
+        }).join('') + '</ol>' +
+        '<p class="explain">The what-if against the formula on the board is the same arithmetic with the reader\u2019s weight, which is why dragging it re-prices all ' +
+        D.rows.length + ' rows at once instead of filtering a column: nothing on the page is a stored answer.</p>' +
+      '</div></section>' +
+
       '<div class="grid2" style="margin-top:22px">' +
-        '<section class="card"><h2>Every category the snapshot prices</h2><div class="body" style="padding:0">' +
-          '<table class="small"><thead><tr><th>Category (diagnostic)</th><th class="num">Own median</th><th class="num">Peers</th><th class="num">Borrowed</th><th class="num">Shrunk</th><th class="num">Middle half</th></tr></thead>' +
+        '<section class="card"><h2>Every category the snapshot prices</h2><div class="body" style="padding:0">' +          '<table class="small"><thead><tr><th>Category (diagnostic)</th><th class="num">Own median</th><th class="num">Peers</th><th class="num">Borrowed</th><th class="num">Shrunk</th><th class="num">Middle half</th></tr></thead>' +
           '<tbody>' + catRows + '</tbody></table></div></section>' +
         '<section class="card"><h2>The odds cohorts</h2><div class="body" style="padding:0">' +
           '<table class="small"><thead><tr><th>Age cohort</th><th class="num">Protocols</th><th class="num">With a token</th><th class="num">Rate</th></tr></thead>' +

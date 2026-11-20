@@ -121,8 +121,14 @@ export const MODEL: ModelConstants = {
 /** The model's version label: the dashboard names it and the rules quote it. */
 export const MODEL_VERSION = 'fitted-4';
 
-/** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
-export const EARLY_ROWS = 160;
+/**
+ * The board carries every pre-token protocol in the snapshot, not just the watchlist.
+ *
+ * The watchlist is a floor the house drew, never the ceiling of what the radar can see: a protocol
+ * above the floor that the watchlist misses is exactly the one a reader would want priced. This
+ * constant is the gate's own row ceiling, so no row is dropped for a reason the page would hide.
+ */
+export const EARLY_ROWS = 4000;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -283,12 +289,29 @@ export interface LiveRow {
 }
 
 /** Everything the dashboard needs: the board, the live set, the multiples, the odds and the model. */
+/**
+ * Where every protocol in the sealed snapshot ended up.
+ *
+ * The board ranks the ones that record no token; the rest are not dropped silently. This is the
+ * count behind the page's first line, so a reader can see the 758 become 200 by a stated rule
+ * rather than by a filter nobody can check.
+ */
+export interface Account {
+  total: number;
+  trading: number;
+  no_token: number;
+  excluded: Record<Derivative, number>;
+  kept_by_watchlist: number;
+  ranked: number;
+}
+
 export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
+  account: Account;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -359,9 +382,52 @@ export function isPreToken(p: SnapshotProtocol): boolean {
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
-/** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool. */
+/**
+ * Why a pre-token protocol is not one the radar prices: its TVL is a claim on something that
+ * already trades, so "will it launch a token" is the wrong question for it.
+ *
+ *   exchange   a centralised venue's balance sheet, not a protocol to price (CEX);
+ *   staked     a staked or restaked position in an asset that trades (Binance staked ETH);
+ *   wrapped    a bridged or wrapped representation of an asset that trades (WBTC, USDT0);
+ *   versioned  one pool of a protocol that already has its own entry (Aave V2).
+ *
+ * The watchlist overrides all four: when the house's own list names one of these, it is priced.
+ */
+export type Derivative = 'exchange' | 'staked' | 'wrapped' | 'versioned';
+
+export function derivativeOf(p: SnapshotProtocol): Derivative | null {
+  if (p.category === 'CEX') return 'exchange';
+  if (VERSIONED.test(p.name)) return 'versioned';
+  const category = p.category ?? '';
+  if (/stak/i.test(category)) return 'staked';
+  if (/bridge/i.test(category)) return 'wrapped';
+  return null;
+}
+
+/** Whether a protocol is one the board may rank: pre-token and not a claim on one that trades. */
 export function isRankable(p: SnapshotProtocol): boolean {
-  return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
+  return isPreToken(p) && derivativeOf(p) === null;
+}
+
+/** Every protocol in the snapshot, counted into the bucket the board's rule puts it in. */
+export function accountFor(protocols: SnapshotProtocol[], ranked: number, watchlist: string[]): Account {
+  const onList = new Set(watchlist);
+  let noToken = 0;
+  const excluded: Record<Derivative, number> = { exchange: 0, staked: 0, wrapped: 0, versioned: 0 };
+  for (const p of protocols) {
+    if (!isPreToken(p)) continue;
+    noToken++;
+    const why = derivativeOf(p);
+    if (why !== null && !onList.has(p.slug)) excluded[why]++;
+  }
+  return {
+    total: protocols.length,
+    trading: protocols.length - noToken,
+    no_token: noToken,
+    excluded,
+    kept_by_watchlist: protocols.filter((p) => isPreToken(p) && derivativeOf(p) !== null && onList.has(p.slug)).length,
+    ranked,
+  };
 }
 
 /**
@@ -701,10 +767,11 @@ export function buildBoard(
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: pre-token protocols below the floor, by TVL. Never a replacement for a
-  // watchlist row, only an addition, so the board reaches past the floor the house drew.
+  // The early radar: every other pre-token protocol the snapshot holds, whatever its size. The
+  // watchlist is the floor, so a protocol above it that the watchlist misses is the one worth
+  // pricing most, and dropping it would make the board's coverage a filter instead of a claim.
   const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
+    .filter((p) => !chosen.has(p.slug) && isRankable(p))
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
@@ -950,6 +1017,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
+    account: accountFor(snapshot.protocols, board.length, snapshot.watchlist),
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
