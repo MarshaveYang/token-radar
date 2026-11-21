@@ -314,6 +314,33 @@ td.cat { color: var(--dim); max-width: 190px; overflow: hidden; text-overflow: e
 .steps li .act { display: block; }
 .steps li .cw { display: block; margin-top: 3px; font: 11px var(--mono); color: var(--faint); }
 
+/* the costed timetable on a protocol page */
+.card h3.mini {
+  margin: 16px 0 2px; font: 600 10.5px/1 var(--mono);
+  letter-spacing: 0.09em; text-transform: uppercase; color: var(--faint);
+}
+table.plan { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.plan th {
+  padding: 0 8px 7px; text-align: left; font: 600 10px/1.4 var(--mono);
+  letter-spacing: 0.07em; text-transform: uppercase; color: var(--faint);
+  border-bottom: 1px solid var(--line);
+}
+table.plan td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); }
+table.plan tbody tr:hover { background: var(--panel-2); }
+table.plan td.n, table.plan th.n { width: 26px; padding-left: 0; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+table.plan td.lab { color: var(--text); }
+table.plan .num, table.plan th.num { text-align: right; font-family: var(--mono); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.plan td.run { color: var(--dim); }
+table.plan tr.exit td { color: var(--mint); }
+table.plan tr.exit td.lab::after { content: " \00b7 exit"; color: var(--faint); font-size: 11px; }
+table.plan tfoot td {
+  padding: 9px 8px; border-top: 1px solid var(--line); border-bottom: 0;
+  font-family: var(--mono); font-size: 11.5px; color: var(--text); font-weight: 600;
+}
+table.plan tfoot td.lab { font-family: system-ui, sans-serif; font-weight: 600; font-size: 12px; }
+.plan-note { margin-top: 10px; font-size: 12.5px; color: var(--dim); }
+.plan-note b { color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+
 /* ---------- method ---------- */
 
 .mhead { max-width: 900px; margin-bottom: 20px; }

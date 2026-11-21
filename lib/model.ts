@@ -172,6 +172,71 @@ export interface FarmStep {
   text: string;
   cost: string;
   time: string;
+  /** A three-word label, so the step can be a row in a timetable. */
+  label: string;
+  /** Cash that leaves the wallet at this step, in dollars. */
+  usd: number;
+  /** Minutes of the reader's own attention at this step. */
+  minutes: number;
+  /** Calendar days this step occupies before the next one can start. */
+  days: number;
+  /** Whether this step closes the position: the plan's stated end. */
+  closes?: boolean;
+}
+
+/** One line of a costed timetable: the step, its price, and the running totals. */
+export interface FarmPlanStep {
+  n: number;
+  label: string;
+  usd: number;
+  minutes: number;
+  days: number;
+  /** Cash spent from step 1 through this step. */
+  spent_usd: number;
+  /** Days elapsed from step 1 through this step. */
+  elapsed_days: number;
+}
+
+/** The farm plan as arithmetic: every step priced, and the totals it adds up to. */
+export interface FarmPlan {
+  steps: FarmPlanStep[];
+  total_usd: number;
+  total_minutes: number;
+  total_days: number;
+  /** Cash at risk beyond the deposit itself: gas, checks, weekly actions. */
+  overhead_usd: number;
+  /** The step where the position is closed, so the plan has a stated end. */
+  exit_step: number;
+}
+
+/** Build the timetable from the steps, adding the running spend and elapsed time. */
+export function farmPlan(steps: FarmStep[], deposit: number): FarmPlan {
+  let spent = 0;
+  let elapsed = 0;
+  const rows: FarmPlanStep[] = steps.map((s, i) => {
+    spent += s.usd;
+    elapsed += s.days;
+    return {
+      n: i + 1,
+      label: s.label,
+      usd: s.usd,
+      minutes: s.minutes,
+      days: s.days,
+      spent_usd: spent,
+      elapsed_days: elapsed,
+    };
+  });
+  const totalUsd = rows.reduce((a, r) => a + r.usd, 0);
+  // The end of the plan is the step that closes the position, not the bookkeeping after it.
+  const closing = steps.findIndex((s) => s.closes === true);
+  return {
+    steps: rows,
+    total_usd: totalUsd,
+    total_minutes: rows.reduce((a, r) => a + r.minutes, 0),
+    total_days: elapsed,
+    overhead_usd: totalUsd - deposit,
+    exit_step: closing >= 0 ? closing + 1 : steps.length,
+  };
 }
 
 /** The economics of one farm position, all from the protocol's own record. */
@@ -245,6 +310,8 @@ export interface RadarRow {
   chain_multiplier: number;
   farm: FarmEconomics;
   farm_steps: string[];
+  /** The same plan as arithmetic: every step priced, with running spend and elapsed days. */
+  farm_plan: FarmPlan;
 }
 
 /**
@@ -729,8 +796,10 @@ export function farmEconomics(p: SnapshotProtocol, age: number | null, implied: 
   const gas = deposit >= 150 ? 8 : 4;
   const hold = holdDaysFor(age);
   const weeks = Math.max(1, Math.round(hold / 7));
-  const minutes = 5 + 15 + 10 * weeks + 10 + 5;
-  const gasTotal = gas + 2 * weeks;
+  // The sum of the plan's own minute column: wallet 5, open 15, record check, weekly actions, hold 0,
+  // claim 10, log 5. Kept equal to the timetable so the headline and the table cannot disagree.
+  const minutes = 35 + recordMinutes(p.change_7d) + 10 * weeks;
+  const gasTotal = 3 + gas + 2 * weeks;
   const falling = p.change_7d !== null && p.change_7d <= -20;
   const verdict = falling
     ? 'skip'
@@ -786,6 +855,7 @@ export function buildBoard(
 
   const board: BoardRow[] = scored.map((s, i) => {
     const farm = farmEconomics(s.p, s.r.age, s.r.implied, s.rowOdds, model);
+    const steps = farmSteps(s.p, s.r.age, farm, s.rowOdds, model);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -814,7 +884,8 @@ export function buildBoard(
         age_days: s.r.age,
       },
       farm,
-      farm_steps: farmSteps(s.p, s.r.age, farm, s.rowOdds, model).map(stepText),
+      farm_steps: steps.map(stepText),
+      farm_plan: farmPlan(steps, farm.deposit_usd),
     };
   });
   return { board, multiples: multipleRows, global, odds, curve, test };
@@ -870,34 +941,56 @@ function actionFor(p: SnapshotProtocol, deposit: number, chain: string): string 
  * The step that reads the protocol's own seven-day record, so two protocols in one category do
  * not get the same plan. Which sentence it carries is decided by change_7d and by the odds.
  */
+/** Minutes the record check takes: a deposit split in two needs a second confirmation. */
+export function recordMinutes(change: number | null): number {
+  return change !== null && change <= -5 && change > -20 ? 10 : 5;
+}
+
 function recordStep(p: SnapshotProtocol, odds: number): FarmStep {
   const ch = p.change_7d;
+  const minutes = recordMinutes(ch);
   if (ch === null) {
     return {
       text: `The snapshot carries no seven-day change for ${p.name}, so treat its TVL as unconfirmed: open the position small and check the protocol's own TVL page before adding to it.`,
       cost: 'the first deposit only',
       time: '5 minutes to check',
+      label: 'Confirm TVL',
+      usd: 0,
+      minutes,
+      days: 0,
     };
   }
   if (ch <= -20) {
     return {
       text: `TVL fell ${ch.toFixed(1)}% in seven days, the fastest drawdown a farm should wait out: hold the deposit small and add only after two weekly snapshots stop falling.`,
       cost: 'the $' + depositFor(p) + ' stays in the position',
-      time: '14 days of watching',
+      time: '14 days of watching, inside the hold window',
+      label: 'Wait out drawdown',
+      usd: 0,
+      minutes,
+      days: 0,
     };
   }
   if (ch <= -5) {
     return {
       text: `TVL is down ${ch.toFixed(1)}% over seven days, so the position is early rather than confirmed: deposit half now and half when the next snapshot turns up.`,
       cost: 'half the deposit now, half later',
-      time: '7 to 14 days between halves',
+      time: '7 to 14 days between halves, both inside the hold',
+      label: 'Split the deposit',
+      usd: 0,
+      minutes,
+      days: 0,
     };
   }
   if (ch >= 20) {
     return {
       text: `TVL is up ${ch.toFixed(1)}% in seven days, so adoption is already moving: deposit in one go and expect the points window to be shorter than a quiet protocol's.`,
       cost: 'the whole deposit at once',
-      time: '15 minutes',
+      time: '5 minutes to confirm',
+      label: 'Move in once',
+      usd: 0,
+      minutes,
+      days: 0,
     };
   }
   return {
@@ -905,7 +998,11 @@ function recordStep(p: SnapshotProtocol, odds: number): FarmStep {
       odds >= 0.6 ? ', and the odds say the wait is worth it' : ''
     }.`,
     cost: 'the deposit only',
-    time: '15 minutes',
+    time: '5 minutes to confirm',
+    label: 'Plain deposit',
+    usd: 0,
+    minutes,
+    days: 0,
   };
 }
 
@@ -917,6 +1014,7 @@ function recordStep(p: SnapshotProtocol, odds: number): FarmStep {
 export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEconomics, odds: number, c: ModelConstants = MODEL): FarmStep[] {
   const chain = chainOf(p);
   const action = actionFor(p, farm.deposit_usd, chain);
+  const weeks = Math.max(1, Math.round(farm.hold_days / 7));
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline: ${
@@ -926,17 +1024,29 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
       }.`,
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
+      label: 'Fresh wallet',
+      usd: 3,
+      minutes: 5,
+      days: 0,
     },
     {
       text: action,
       cost: `$${farm.deposit_usd} of capital and about $${farm.gas_usd} of gas`,
       time: '15 minutes to set up',
+      label: 'Open position',
+      usd: farm.deposit_usd + farm.gas_usd,
+      minutes: 15,
+      days: 0,
     },
     recordStep(p, odds),
     {
       text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote, and keep every receipt in one folder.`,
-      cost: `about $2 of gas a week for ${Math.max(1, Math.round(farm.hold_days / 7))} weeks`,
+      cost: `about $2 of gas a week for ${weeks} weeks`,
       time: '10 minutes a week',
+      label: `Weekly action \u00d7${weeks}`,
+      usd: 2 * weeks,
+      minutes: 10 * weeks,
+      days: 0,
     },
     {
       text: `Hold for at least ${farm.hold_days} days (this protocol is ${
@@ -946,16 +1056,29 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
       } of your time, and its gas is ${(farm.cost_bps / 100).toFixed(0)}% of the deposit.`,
       cost: `the $${farm.deposit_usd} stays in the position`,
       time: `${farm.hold_days} days`,
+      label: `Hold ${farm.hold_days} days`,
+      usd: 0,
+      minutes: 0,
+      days: farm.hold_days,
     },
     {
       text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes: never pay to claim, and never sign a claim you did not start.`,
       cost: 'no fee to check',
       time: '10 minutes',
+      label: 'Claim, then exit',
+      usd: 0,
+      minutes: 10,
+      days: 0,
+      closes: true,
     },
     {
       text: `Write the wallet, the dates and every transaction in a farm log, so the position can be repeated, sized up or unwound without guessing which deposits counted.`,
       cost: 'nothing but the log',
       time: '5 minutes',
+      label: 'Farm log',
+      usd: 0,
+      minutes: 5,
+      days: 0,
     },
   ];
 }
@@ -1003,6 +1126,7 @@ export function radarRow(row: BoardRow, watchlist: readonly string[]): RadarRow 
     chain_multiplier: row.model.chain_multiplier,
     farm: row.farm,
     farm_steps: row.farm_steps,
+    farm_plan: row.farm_plan,
   };
 }
 

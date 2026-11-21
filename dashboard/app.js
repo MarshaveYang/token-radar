@@ -208,6 +208,13 @@
     });
     var onList = D.rows.filter(function (r) { return r.watchlisted; }).length;
     var banded = D.rows.every(function (r) { return r.implied_low_usd < r.implied_value_usd && r.implied_value_usd < r.implied_high_usd; });
+    var plansOk = D.rows.every(function (r) {
+      var p = r.farm_plan;
+      if (!p || !p.steps || !p.steps.length) return false;
+      var u = 0, m = 0, d = 0;
+      p.steps.forEach(function (s) { u += s.usd; m += s.minutes; d += s.days; });
+      return u === p.total_usd && m === p.total_minutes && d === p.total_days && m === r.farm.minutes;
+    });
     return [
       ['prices', worstDrift < 0.0002, D.rows.length + '/' + D.rows.length + ', drift ' + (worstDrift * 100).toFixed(3) + '%',
         'every printed value is the product of the five factors printed beside it'],
@@ -217,6 +224,8 @@
         'every protocol the snapshot calls pre-token appears, none dropped'],
       ['bands', banded, D.rows.length + '/' + D.rows.length + ' bracket their value',
         'the low\u2013high band is the value divided and multiplied by the same miss'],
+      ['plans', plansOk, D.rows.length + '/' + D.rows.length + ' add up',
+        'every farm plan\u2019s totals are the sum of its own step columns, and its minute total is the headline figure'],
       ['offline', netRefs === 0, netRefs === 0 ? '0 network addresses' : netRefs + ' found',
         'the page renders from one local dataset: no fetch, no absolute URL in its markup']
     ];
@@ -454,6 +463,35 @@
       return '<li><span class="act">' + esc(act) + '</span>' + (cw ? '<span class="cw">' + esc(cw) + '</span>' : '') + '</li>';
     }).join('');
 
+    var plan = r.farm_plan || { steps: [], total_usd: 0, total_minutes: 0, total_days: 0, overhead_usd: 0, exit_step: 0 };
+    var planRows = plan.steps.map(function (s) {
+      return '<tr' + (s.n === plan.exit_step ? ' class="exit"' : '') + '>' +
+        '<td class="n">' + s.n + '</td>' +
+        '<td class="lab">' + esc(s.label) + '</td>' +
+        '<td class="num">' + (s.usd ? usd(s.usd) : '\u2014') + '</td>' +
+        '<td class="num">' + (s.minutes ? s.minutes + ' min' : '\u2014') + '</td>' +
+        '<td class="num">' + (s.days ? s.days + ' d' : '\u2014') + '</td>' +
+        '<td class="num run">' + usd(s.spent_usd) + '</td>' +
+        '<td class="num run">' + s.elapsed_days + ' d</td>' +
+        '</tr>';
+    }).join('');
+    var planTable = plan.steps.length
+      ? '<table class="plan">' +
+          '<thead><tr><th class="n">#</th><th class="lab">Step</th><th class="num">Cost</th>' +
+          '<th class="num">Your time</th><th class="num">Waits</th><th class="num">Spent so far</th><th class="num">Day</th></tr></thead>' +
+          '<tbody>' + planRows + '</tbody>' +
+          '<tfoot><tr><td class="n"></td><td class="lab">Whole plan, step ' + plan.exit_step + ' closes it</td>' +
+          '<td class="num">' + usd(plan.total_usd) + '</td><td class="num">' + plan.total_minutes + ' min</td>' +
+          '<td class="num">' + plan.total_days + ' d</td><td class="num">' + usd(plan.total_usd) + '</td>' +
+          '<td class="num">' + plan.total_days + ' d</td></tr></tfoot>' +
+        '</table>' +
+        '<p class="plan-note">Of the <b>' + usd(plan.total_usd) + '</b> that leaves the wallet, <b>' + usd(r.farm.deposit_usd) +
+          '</b> is the deposit and comes back at step ' + plan.exit_step + '; the remaining <b>' + usd(plan.overhead_usd) +
+          '</b> is gas and checks that do not, which is ' + (Math.round(plan.overhead_usd / r.farm.deposit_usd * 100)) +
+          '% of the deposit \u2014 the price of holding the position through the window. The model puts <b>' + pct(r.odds) +
+          '</b> on the launch and prices it at <b>' + usd(r.implied_value_usd) + '</b>; it does not claim a farmer captures that value, only that this is what being present for it costs.</p>'
+      : '';
+
     root.innerHTML = '' +
       '<a class="back" href="#/">\u2190 All ' + D.rows.length + ' protocols</a>' +
       '<div class="dhead">' +
@@ -506,17 +544,13 @@
       '<section class="card" style="margin-top:18px">' +
         '<h2>Farm plan \u2014 ' + r.farm.verdict + '</h2>' +
         '<div class="body">' +
-          '<div class="chain-of" style="margin-bottom:14px">' +
-            '<div class="step-cell"><div class="k">Deposit</div><div class="v">' + usd(r.farm.deposit_usd) + '</div></div>' +
-            '<div class="step-cell"><div class="k">Gas, whole window</div><div class="v">' + usd(r.farm.gas_usd) + '</div></div>' +
-            '<div class="step-cell"><div class="k">Hold</div><div class="v">' + r.farm.hold_days + ' d</div></div>' +
-            '<div class="step-cell"><div class="k">Your time</div><div class="v">' + (r.farm.minutes >= 120 ? (r.farm.minutes / 60).toFixed(1) + ' h' : r.farm.minutes + ' min') + '</div></div>' +
-            '<div class="step-cell"><div class="k">Gas / deposit</div><div class="v">' + (r.farm.cost_bps / 100).toFixed(0) + '%</div></div>' +
-          '</div>' +
+          planTable +
+          '<h3 class="mini">What each step asks of you</h3>' +
           '<ol class="steps">' + steps + '</ol>' +
           '<p class="explain">The verdict is a stated policy, not a promise: <var>farmEconomics</var> farms a protocol whose odds clear ' + pct(D.model.farm_odds) +
             ' and whose implied value clears ' + usd(D.model.farm_min_implied_usd) + ', watches one that clears ' + pct(D.model.watch_odds) + ' or ' + usd(D.model.watch_min_implied_usd) +
-            ', and skips the rest and anything whose TVL fell 20% or more in seven days.</p>' +
+            ', and skips the rest and anything whose TVL fell 20% or more in seven days. Gas over the window is ' + (r.farm.cost_bps / 100).toFixed(0) +
+            '% of the deposit: <var>farmPlan</var> adds the steps up, and the totals above are that sum, not a restatement of it.</p>' +
         '</div>' +
       '</section>' + foot();
 
@@ -595,7 +629,8 @@
           ' dropped because their TVL is a claim on an asset that already trades (' + D.account.excluded.exchange + ' exchange, ' + D.account.excluded.staked + ' staked, ' +
           D.account.excluded.wrapped + ' wrapped or bridged, ' + D.account.excluded.versioned + ' versioned), except where the watchlist names one' +
           (D.account.kept_by_watchlist ? ' \u2014 it does ' + D.account.kept_by_watchlist + ' times \u2014' : '') + '. ' + D.account.ranked + ' priced. ' : '') +
-        'Five checks run on every load and each can fail:</p>' +
+        'The farm plans are arithmetic too: each step carries its own dollars and minutes, and the totals under the table are the sum of those columns rather than a second figure to be trusted. ' +
+        proofList().length + ' checks run on every load and each one can fail:</p>' +
         '<ol class="steps">' + proofList().map(function (p) {
           return '<li><b>' + p[0] + '</b> \u2014 ' + esc(p[3]) + '. Measured now: <var>' + esc(p[2]) + '</var>.</li>';
         }).join('') + '</ol>' +
